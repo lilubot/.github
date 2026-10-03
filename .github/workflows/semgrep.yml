@@ -1,0 +1,52 @@
+name: semgrep-reusable
+
+# Shared Semgrep CE gate for lilubot repos. Runs on the cupid-semgrep pool,
+# which bakes Semgrep + the fleet rule pack at /opt/semgrep-rules.
+# Push scans report legacy findings and stay green; PR scans fail only on
+# findings new relative to the base commit (--baseline-commit).
+#
+# Callers must NOT use `paths`/`paths-ignore` filters: this job is a required
+# status check, and a filtered-out run never reports, which blocks the PR.
+
+on:
+  workflow_call:
+    inputs:
+      packs:
+        description: Extra registry packs, whitespace-separated (e.g. "p/cpp p/csharp")
+        type: string
+        default: ""
+      timeout-minutes:
+        type: number
+        default: 45
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: [self-hosted, cupid-semgrep]
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Semgrep CE
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXTRA_PACKS: ${{ inputs.packs }}
+        run: |
+          set -euo pipefail
+          args=(
+            --config p/ci
+            --config p/secrets
+            --config /opt/semgrep-rules
+            --metrics=off
+            --disable-version-check
+          )
+          for p in $EXTRA_PACKS; do args+=(--config "$p"); done
+          if [ -n "${BASE_SHA}" ]; then
+            semgrep scan "${args[@]}" --baseline-commit "$BASE_SHA" --error
+          else
+            semgrep scan "${args[@]}"
+          fi
