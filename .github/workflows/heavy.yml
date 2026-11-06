@@ -21,7 +21,7 @@ name: heavy-reusable
 #   runner   (required) runs-on label list, e.g. ["self-hosted","nima-linux"]
 #   cmd      (required) command, run with `shell`
 #   timeout  minutes, default 60 (fleet rule: <= 2x p90)
-#   shell    bash (default) | pwsh
+#   shell    bash (default) | pwsh | powershell (Windows PowerShell 5.1)
 #   setup    none (default) | python (uv) | node | dotnet
 #   setup-version  version for setup (node/dotnet/python), optional
 #   setup-cmd      extra toolchain command before cmd (rustup, godot, ...)
@@ -282,7 +282,7 @@ jobs:
         with:
           dotnet-version: ${{ matrix.leg['setup-version'] }}
       - name: Toolchain (bash)
-        if: matrix.leg['setup-cmd'] && matrix.leg.shell != 'pwsh'
+        if: matrix.leg['setup-cmd'] && matrix.leg.shell != 'pwsh' && matrix.leg.shell != 'powershell'
         shell: bash
         env:
           SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
@@ -293,8 +293,14 @@ jobs:
         env:
           SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
         run: Invoke-Expression $env:SETUP_CMD
+      - name: Toolchain (powershell)
+        if: matrix.leg['setup-cmd'] && matrix.leg.shell == 'powershell'
+        shell: powershell
+        env:
+          SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
+        run: Invoke-Expression $env:SETUP_CMD
       - name: Run ${{ matrix.leg.name }} (bash)
-        if: matrix.leg.shell != 'pwsh'
+        if: matrix.leg.shell != 'pwsh' && matrix.leg.shell != 'powershell'
         shell: bash
         env:
           LEG_CMD: ${{ matrix.leg.cmd }}
@@ -302,6 +308,14 @@ jobs:
       - name: Run ${{ matrix.leg.name }} (pwsh)
         if: matrix.leg.shell == 'pwsh'
         shell: pwsh
+        env:
+          LEG_CMD: ${{ matrix.leg.cmd }}
+        run: |
+          Invoke-Expression $env:LEG_CMD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run ${{ matrix.leg.name }} (powershell)
+        if: matrix.leg.shell == 'powershell'
+        shell: powershell
         env:
           LEG_CMD: ${{ matrix.leg.cmd }}
         run: |

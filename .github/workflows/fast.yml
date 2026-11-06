@@ -39,7 +39,7 @@ on:
         type: string
         default: ""
       shell:
-        description: bash | pwsh
+        description: bash | pwsh | powershell (Windows PowerShell 5.1)
         type: string
         default: bash
       fetch-depth:
@@ -92,7 +92,7 @@ jobs:
         with:
           dotnet-version: ${{ inputs.setup-version }}
       - name: Run ${{ matrix.check }} (bash)
-        if: inputs.shell != 'pwsh'
+        if: inputs.shell != 'pwsh' && inputs.shell != 'powershell'
         shell: bash
         run: |
           case "$CHECK" in lint) cmd=$LINT_CMD ;; typecheck) cmd=$TYPECHECK_CMD ;; *) cmd=$TEST_CMD ;; esac
@@ -102,9 +102,13 @@ jobs:
       - name: Run ${{ matrix.check }} (pwsh)
         if: inputs.shell == 'pwsh'
         shell: pwsh
-        run: |
+        run: &pwsh-check-run |
           $cmd = switch ($env:CHECK) { 'lint' { $env:LINT_CMD } 'typecheck' { $env:TYPECHECK_CMD } default { $env:TEST_CMD } }
           if (-not $cmd) { Write-Output "::notice::$($env:CHECK): no command in this repo's fleet profile; passing"; exit 0 }
           if ($env:SETUP_CMD) { Invoke-Expression $env:SETUP_CMD; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
           Invoke-Expression $cmd
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run ${{ matrix.check }} (powershell)
+        if: inputs.shell == 'powershell'
+        shell: powershell
+        run: *pwsh-check-run

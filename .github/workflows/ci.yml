@@ -88,7 +88,8 @@ jobs:
       legs: >-
         [{"name":"bash","runner":["ubuntu-24.04"],"cmd":"bash tests/fleet-ci.test.sh","timeout":5},
          {"name":"pwsh","runner":["ubuntu-24.04"],"shell":"pwsh","cmd":"Write-Output ok; exit 0","timeout":5},
-         {"name":"node","runner":["ubuntu-24.04"],"setup":"node","setup-version":"22","setup-cmd":"node --version","cmd":"node -e \"process.exit(0)\"","timeout":5}]
+         {"name":"node","runner":["ubuntu-24.04"],"setup":"node","setup-version":"22","setup-cmd":"node --version","cmd":"node -e \"process.exit(0)\"","timeout":5},
+         {"name":"powershell","runner":["windows-2025"],"shell":"powershell","setup-cmd":"$PSVersionTable.PSVersion","cmd":"if ($PSVersionTable.PSVersion.Major -ne 5) { exit 1 }","timeout":10}]
 
   heavy-again:
     needs: heavy

@@ -30,7 +30,7 @@ jobs:
   fast:
     uses: lilubot/.github/.github/workflows/fast.yml@<sha> # v1
     permissions: {contents: read}
-    with: {runner: '["self-hosted","fleet-fast"]', setup: dotnet, setup-version: "8.0.x", lint-cmd: dotnet format --verify-no-changes, test-cmd: dotnet test -c Release --filter Category!=Slow, shell: pwsh}
+    with: {runner: '["self-hosted","fleet-fast"]', setup: dotnet, setup-version: "8.0.x", lint-cmd: dotnet format --verify-no-changes, test-cmd: dotnet test -c Release --filter Category!=Slow, shell: powershell}
   heavy:
     needs: fast
     uses: lilubot/.github/.github/workflows/heavy.yml@<sha> # v1
@@ -40,7 +40,7 @@ jobs:
       control-runner: '["self-hosted","fleet-fast"]'
       lanes: '{"next":"^(lilubot/batch-|hotfix/)","main":"^train/[0-9]{4}-[0-9]{2}-[0-9]{2}(-[1-9][0-9]*)?$"}'
       legs: >-
-        [{"name":"native","runner":["self-hosted","creo-win"],"shell":"pwsh","cmd":"./ci/native.ps1","timeout":60},
+        [{"name":"native","runner":["self-hosted","creo-win"],"shell":"powershell","cmd":"./ci/native.ps1","timeout":60},
          {"name":"linux","runner":["self-hosted","fleet-heavy"],"setup":"python","cmd":"scripts/ci/linux.sh","timeout":60,"artifacts":"junit*.xml"}]
 ```
 
