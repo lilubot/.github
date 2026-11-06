@@ -1,0 +1,54 @@
+name: tree-verdict
+description: >-
+  Look up or post a heavy-CI verdict keyed by git tree SHA (fleet CI standard
+  §4.3). heavy.yml uses the same logic internally; use this action to add
+  verdict reuse to a job that is not heavy.yml. Needs bash and gh.
+inputs:
+  mode:
+    description: lookup | post
+    required: true
+  context:
+    description: Commit-status context carrying the verdict
+    default: verdict/heavy
+  sha:
+    description: Commit under test (lookup) / commit to stamp (post)
+    default: ${{ github.sha }}
+  head-sha:
+    description: PR head SHA, a second lookup candidate
+    default: ${{ github.event.pull_request.head.sha }}
+  tree:
+    description: post only; tree SHA the verdict covers (lookup output `tree`)
+    default: ""
+  url:
+    description: post only; run URL that proved the tree (default this run)
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  token:
+    description: Needs contents/statuses/pull-requests/actions read (lookup) or statuses write (post)
+    default: ${{ github.token }}
+outputs:
+  hit:
+    description: "'true' when a valid verdict for this tree exists"
+    value: ${{ steps.run.outputs.hit }}
+  tree:
+    value: ${{ steps.run.outputs.tree }}
+  url:
+    value: ${{ steps.run.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ inputs.sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        TREE: ${{ inputs.tree }}
+        URL: ${{ inputs.url }}
+        CONTEXT: ${{ inputs.context }}
+        RUN_ID: ${{ github.run_id }}
+        SERVER_URL: ${{ github.server_url }}
+      run: |
+        case "$MODE" in lookup|post) ;; *) echo "::error::tree-verdict: mode must be lookup or post"; exit 1 ;; esac
+        bash "$GITHUB_ACTION_PATH/../../scripts/fleet-ci.sh" "$MODE" | tee -a "$GITHUB_OUTPUT"

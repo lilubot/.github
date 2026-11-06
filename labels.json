@@ -1,0 +1,9 @@
+[
+  {"name": "draft-exempt", "color": "0E8A16", "description": "Stay ready: skip draft enforcement (any head)"},
+  {"name": "batch-candidate", "color": "0E8A16", "description": "Draft headed for the next batch: runs the fast lane"},
+  {"name": "bot-review", "color": "5319E7", "description": "Batch PR: CodeRabbit review trigger (set by the batch builder)"},
+  {"name": "ocr-rerun", "color": "EDEDED", "description": "Re-run the OCR review on this PR"},
+  {"name": "hotfix", "color": "0E8A16", "description": "Hotfix lane: a batch of 1 into next"},
+  {"name": "batch-member", "color": "B60205", "description": "Draft member of a batch PR; closes as included, never goes ready"},
+  {"name": "fix-merged-unconfirmed", "color": "FBCA04", "description": "A landed change claims to fix this; awaiting confirmation before close"}
+]
