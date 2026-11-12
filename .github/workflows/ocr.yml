@@ -155,10 +155,10 @@ jobs:
           esac
           # Execution-time truth for BOTH event paths (dispatch has no PR
           # payload; a queued run must not trust stale payload facts).
-          read -r sha base fork draft state skipauthor < <(
+          read -r sha base fork draft state skipauthor number < <(
             gh pr view "${DISPATCH_PR}${PR_NUMBER}" --repo "$GITHUB_REPOSITORY" \
-              --json headRefOid,baseRefName,isCrossRepository,isDraft,state,author \
-              --jq '[.headRefOid, .baseRefName, .isCrossRepository, .isDraft, .state, (.author.login as $a | env.SKIP_AUTHORS | fromjson | any(.[]; . == $a))] | @tsv'
+              --json headRefOid,baseRefName,isCrossRepository,isDraft,state,author,number \
+              --jq '[.headRefOid, .baseRefName, .isCrossRepository, .isDraft, .state, (.author.login as $a | env.SKIP_AUTHORS | fromjson | any(.[]; . == $a)), .number] | @tsv'
           )
           # Dispatch has no requested head (github.sha is the dispatch ref,
           # not the PR head): the live head resolved above is the target.
@@ -166,7 +166,6 @@ jobs:
             echo "::error::PR head moved since this review was requested ($EXPECTED_SHA -> $sha); refusing stale review target"
             exit 1
           fi
-          number="${DISPATCH_PR}${PR_NUMBER}"
           {
             echo "sha=$sha"
             echo "base=$base"
@@ -210,6 +209,10 @@ jobs:
           # or stale `ocr` on PATH must never shadow the pinned CLI.
           export npm_config_prefix="$RUNNER_TEMP/ocr-tools"
           mkdir -p "$npm_config_prefix"
+          # Never read registry/install configuration from the PR checkout.
+          install_dir=$(mktemp -d "$RUNNER_TEMP/ocr-install.XXXXXX")
+          trap 'rm -rf "$install_dir"' EXIT
+          cd "$install_dir"
           # Exact reviewer version, scripts disabled, isolated runner-temp
           # prefix; this review never judges merge readiness.
           if command -v npm >/dev/null 2>&1; then

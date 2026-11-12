@@ -27,6 +27,7 @@ name: pr-hygiene-reusable
 # commit status via a non-atomic GET-then-POST, so splitting the group lets an
 # older observation land after a newer one; the scan cron self-heals a
 # superseded pending run).
+# Unchanged merge-conflict state, description and target URL are not reposted.
 #
 # Draft-guard lanes that keep a PR ready (everything else is returned to
 # draft with a comment): same-repo head matching `ready-heads` (dated trains,
@@ -299,6 +300,7 @@ jobs:
           import os
           import re
           import time
+          from urllib.parse import urlencode
           from urllib.request import Request, urlopen
 
           bases = {b.strip() for b in os.environ["BASES"].split(",") if b.strip()}
@@ -318,12 +320,26 @@ jobs:
                   return json.load(response)
 
           def publish(number, head, state, description):
-              request("/statuses/" + head, {
+              status = {
                   "context": "merge-conflict",
                   "state": state,
                   "description": description,
                   "target_url": f"{server}/{repository}/pull/{number}",
-              })
+              }
+              # Statuses are newest first. Never let an older matching status
+              # hide a later transition, including one on a subsequent page.
+              for page in range(1, 11):
+                  previous = request(f"/commits/{head}/statuses?per_page=100&page={page}")
+                  latest = next((s for s in previous if s["context"] == status["context"]), None)
+                  if latest is not None:
+                      if all(latest.get(key) == value for key, value in status.items()):
+                          return
+                      break
+                  if len(previous) < 100:
+                      break
+              else:
+                  raise RuntimeError("Status scan limit reached; refusing a duplicate status")
+              request("/statuses/" + head, status)
 
           # Aggregate retry-sleep budget: 101 unknown PRs used to mean 606 s
           # of mandatory sleep inside a 600 s job. Attempts are never
@@ -382,7 +398,8 @@ jobs:
               numbers = []
               for base in sorted(bases):
                   for page in range(1, 6):
-                      prs = request(f"/pulls?state=open&base={base}&per_page=100&page={page}")
+                      query = urlencode({"state": "open", "base": base, "per_page": 100, "page": page})
+                      prs = request("/pulls?" + query)
                       numbers.extend(pr["number"] for pr in prs)
                       if len(prs) < 100:
                           break

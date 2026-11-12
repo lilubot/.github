@@ -46,6 +46,10 @@ jobs:
 
 `setup` covers `python` (uv), `node`, `dotnet`; anything else (Rust, Godot, Unity, Luau) is `setup-cmd` on a runner that has the toolchain. Pools with 0 online runners fail in seconds with the pool named (heavy's `verdict` job; `preflight.yml` for the other lanes) when `runner-read-token` (Administration: read) is passed; otherwise a warning says the check was skipped.
 
+Runner discovery paginates repository-scoped runners only. Organization runner groups require separate organization permissions and access-policy validation; do not rely on this preflight for organization-only pools.
+
+PowerShell profiles (`pwsh` and Windows PowerShell 5.1) must explicitly check `$LASTEXITCODE` immediately after native commands that can fail (for example, `dotnet test; if ($LASTEXITCODE) { exit $LASTEXITCODE }`). A later native command can overwrite that exit code; the workflow's final check alone cannot detect earlier failures. Handle expected nonzero exits explicitly in the profile.
+
 ## Tree-verdict reuse (heavy)
 
 On a miss heavy runs its legs, then posts commit status `verdict/heavy` = `tree=<T>` on the PR head (push: the pushed SHA). The next run whose commit has tree `T` (the squash on next, the train PR, the main push) finds it through `GET /commits/{sha}/pulls`, checks the creator is `github-actions[bot]` and the linked run is this repo's same workflow file with conclusion `success`, skips the legs, and re-stamps. Equal trees include equal workflow files, so the battery is identical. Any doubt is a miss. Limit: a write-access author could post a forged status from a modified workflow; that workflow is part of the tree it covers, so it lands only through review.

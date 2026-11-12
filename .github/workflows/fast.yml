@@ -73,6 +73,7 @@ jobs:
       TYPECHECK_CMD: ${{ inputs.typecheck-cmd }}
       TEST_CMD: ${{ inputs.test-cmd }}
       SETUP_CMD: ${{ inputs.setup-cmd }}
+      SETUP: ${{ inputs.setup }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,6 +98,7 @@ jobs:
         run: |
           case "$CHECK" in lint) cmd=$LINT_CMD ;; typecheck) cmd=$TYPECHECK_CMD ;; *) cmd=$TEST_CMD ;; esac
           if [ -z "$cmd" ]; then echo "::notice::$CHECK: no command in this repo's fleet profile; passing"; exit 0; fi
+          case "${SETUP,,}" in none|python|node|dotnet) ;; *) echo "::error::Unsupported setup value"; exit 1 ;; esac
           if [ -n "$SETUP_CMD" ]; then eval "$SETUP_CMD"; fi
           eval "$cmd"
       - name: Run ${{ matrix.check }} (pwsh)
@@ -105,6 +107,7 @@ jobs:
         run: &pwsh-check-run |
           $cmd = switch ($env:CHECK) { 'lint' { $env:LINT_CMD } 'typecheck' { $env:TYPECHECK_CMD } default { $env:TEST_CMD } }
           if (-not $cmd) { Write-Output "::notice::$($env:CHECK): no command in this repo's fleet profile; passing"; exit 0 }
+          if ($env:SETUP -notin @('none', 'python', 'node', 'dotnet')) { Write-Output "::error::Unsupported setup value"; exit 1 }
           if ($env:SETUP_CMD) { Invoke-Expression $env:SETUP_CMD; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
           Invoke-Expression $cmd
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

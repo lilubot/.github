@@ -87,9 +87,9 @@ jobs:
       verdict-context: verdict/selftest
       legs: >-
         [{"name":"bash","runner":["ubuntu-24.04"],"cmd":"bash tests/fleet-ci.test.sh","timeout":5},
-         {"name":"pwsh","runner":["ubuntu-24.04"],"shell":"pwsh","cmd":"Write-Output ok; exit 0","timeout":5},
+         {"name":"pwsh","runner":["ubuntu-24.04"],"shell":"pwsh","cmd":"bash -c 'exit 7'; if ($LASTEXITCODE -ne 7) { exit 1 }; bash -c 'exit 0'; if ($LASTEXITCODE) { exit $LASTEXITCODE }","timeout":5},
          {"name":"node","runner":["ubuntu-24.04"],"setup":"node","setup-version":"22","setup-cmd":"node --version","cmd":"node -e \"process.exit(0)\"","timeout":5},
-         {"name":"powershell","runner":["windows-2025"],"shell":"powershell","setup-cmd":"$PSVersionTable.PSVersion","cmd":"if ($PSVersionTable.PSVersion.Major -ne 5) { exit 1 }","timeout":10}]
+         {"name":"powershell","runner":["windows-2025"],"shell":"powershell","setup-cmd":"$PSVersionTable.PSVersion","cmd":"if ($PSVersionTable.PSVersion.Major -ne 5) { exit 1 }; cmd /c exit 7; if ($LASTEXITCODE -ne 7) { exit 1 }; cmd /c exit 0; if ($LASTEXITCODE) { exit $LASTEXITCODE }","timeout":10}]
 
   heavy-again:
     needs: heavy

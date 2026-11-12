@@ -118,15 +118,14 @@ jobs:
           # Fails when a self-hosted pool has 0 online runners, so a leg errors in
           # seconds instead of queueing for GitHub's 24 h limit. GitHub-hosted pools
           # (no "self-hosted" label) are not checked. No token: warn, skip the check.
-          # ponytail: one page of 100 runners; paginate when a repo registers more.
           fleet_pools() {
             if [ -z "${GH_TOKEN:-}" ]; then
               echo "::warning::runner-read-token not set: cannot verify runner pools are online; an offline pool will queue, not fail" >&2
               return 0
             fi
             local rows bad=0 n pool
-            rows=$(gh api "repos/$REPO/actions/runners?per_page=100" --jq "
-              [.runners[] | select(.status == \"online\") | [.labels[].name | ascii_downcase]] as \$on
+            rows=$(gh api "repos/$REPO/actions/runners?per_page=100" --paginate --slurp --jq "
+              [.[].runners[] | select(.status == \"online\") | [.labels[].name | ascii_downcase]] as \$on
               | ${POOLS} | .[] | map(ascii_downcase) as \$p
               | if (\$p | index(\"self-hosted\")) == null then empty
                 else \"\([\$on[] | select(. as \$l | \$p | all(. as \$x | \$l | index(\$x) != null))] | length)\t\(\$p | join(\",\"))\" end") \
@@ -267,7 +266,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: ${{ matrix.leg['fetch-depth'] || 1 }}
+          fetch-depth: ${{ format('{0}', matrix.leg['fetch-depth']) || 1 }}
       - if: matrix.leg.setup == 'python'
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:

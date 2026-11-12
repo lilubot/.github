@@ -25,14 +25,18 @@ mkdir -p "$work/bin" "$work/fix"
 cat >"$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = api ] || exit 2; shift
-method=GET filter=. ep=
+method=GET filter=. ep= slurp=0
 while [ $# -gt 0 ]; do
-  case "$1" in -X) method=$2; shift 2 ;; --jq) filter=$2; shift 2 ;; -f) shift 2 ;; *) ep=$1; shift ;; esac
+  case "$1" in -X) method=$2; shift 2 ;; --jq) filter=$2; shift 2 ;; --paginate) shift ;; --slurp) slurp=1; shift ;; -f) shift 2 ;; *) ep=$1; shift ;; esac
 done
 if [ "$method" = POST ]; then echo "$ep" >>"$FIX/posts.log"; [ -e "$FIX/post-fails" ] && exit 1; echo '{}'; exit 0; fi
 f="$FIX/$(echo "${ep%%\?*}" | tr / _).json"
 [ -f "$f" ] || exit 1
-jq -r "$filter" "$f"
+if [ "$slurp" = 1 ]; then
+  jq -s -r "$filter" "$f" "${f%.json}".page*.json
+else
+  jq -r "$filter" "$f"
+fi
 EOF
 chmod +x "$work/bin/gh"
 export PATH="$work/bin:$PATH" FIX="$work/fix"
@@ -61,8 +65,10 @@ cat >"$FIX/repos_o_r_actions_runners.json" <<'EOF'
  {"status":"offline","labels":[{"name":"self-hosted"},{"name":"creo-win"}]},
  {"status":"online","labels":[{"name":"self-hosted"},{"name":"nima-linux"},{"name":"ARM64"}]}]}
 EOF
+echo '{"runners":[{"status":"online","labels":[{"name":"self-hosted"},{"name":"page-two"}]}]}' >"$FIX/repos_o_r_actions_runners.page2.json"
 export REPO=o/r
 if GH_TOKEN=x POOLS='[["self-hosted","nima-fast"],["self-hosted","nima-linux","arm64"],["ubuntu-24.04"]]' run pools; then ok "pools all online (case-insensitive, hosted skipped)"; else bad pools-online "$(cat "$work/err")"; fi
+if GH_TOKEN=x POOLS='[["self-hosted","page-two"]]' run pools; then ok "pools: matching runner on second page"; else bad pools-pagination "$(cat "$work/err")"; fi
 if GH_TOKEN=x POOLS='[["self-hosted","nima-fast"],["self-hosted","creo-win"]]' run pools; then bad pools-offline "passed"
 elif grep -q "creo-win\] has 0 online" "$work/err"; then ok "pools: offline creo-win fails with a clear error"; else bad pools-offline "$(cat "$work/err")"; fi
 if GH_TOKEN= POOLS='[["self-hosted","creo-win"]]' run pools && grep -q "cannot verify" "$work/err"; then ok "pools: no token warns, does not fail"; else bad pools-notoken "$(cat "$work/err")"; fi
