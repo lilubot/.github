@@ -1,0 +1,117 @@
+name: fast-reusable
+
+# Fleet CI standard L1 (workflow-audit-2026-11-06 §4.1): lint, typecheck and
+# the fast test tier, as checks `<caller job> / lint|typecheck|fast`.
+# Runner-agnostic: runner, toolchain and every command come from the caller
+# (the repo's fleet profile). A check whose command is empty passes with a
+# notice, so one required-check set fits every repo.
+#
+# Drafts: skipped unless labelled `draft-label` (batch candidates get fast
+# feedback; other drafts cost nothing). Caller grants: contents: read.
+# Concurrency is the caller's.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON label list for runs-on, e.g. '["self-hosted","nima-fast"]' or '["windows-2025"]'
+        type: string
+        required: true
+      setup:
+        description: none | python (uv) | node | dotnet
+        type: string
+        default: none
+      setup-version:
+        description: Toolchain version for setup (optional)
+        type: string
+        default: ""
+      setup-cmd:
+        description: Extra toolchain command before the check (rustup, godot import, pnpm install, ...)
+        type: string
+        default: ""
+      lint-cmd:
+        type: string
+        default: ""
+      typecheck-cmd:
+        type: string
+        default: ""
+      test-cmd:
+        type: string
+        default: ""
+      shell:
+        description: bash | pwsh | powershell (Windows PowerShell 5.1)
+        type: string
+        default: bash
+      fetch-depth:
+        type: number
+        default: 1
+      timeout-minutes:
+        type: number
+        default: 15
+      draft-label:
+        description: Label that lets a draft PR run this lane
+        type: string
+        default: batch-candidate
+
+permissions: {}
+
+jobs:
+  check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, inputs.draft-label)
+    name: ${{ matrix.check }}
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [lint, typecheck, fast]
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      CHECK: ${{ matrix.check }}
+      LINT_CMD: ${{ inputs.lint-cmd }}
+      TYPECHECK_CMD: ${{ inputs.typecheck-cmd }}
+      TEST_CMD: ${{ inputs.test-cmd }}
+      SETUP_CMD: ${{ inputs.setup-cmd }}
+      SETUP: ${{ inputs.setup }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+      - if: inputs.setup == 'python'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ inputs.setup-version }}
+          enable-cache: false
+      - if: inputs.setup == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.setup-version || 'lts/*' }}
+      - if: inputs.setup == 'dotnet'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ inputs.setup-version }}
+      - name: Run ${{ matrix.check }} (bash)
+        if: inputs.shell != 'pwsh' && inputs.shell != 'powershell'
+        shell: bash
+        run: |
+          case "$CHECK" in lint) cmd=$LINT_CMD ;; typecheck) cmd=$TYPECHECK_CMD ;; *) cmd=$TEST_CMD ;; esac
+          if [ -z "$cmd" ]; then echo "::notice::$CHECK: no command in this repo's fleet profile; passing"; exit 0; fi
+          case "${SETUP,,}" in none|python|node|dotnet) ;; *) echo "::error::Unsupported setup value"; exit 1 ;; esac
+          if [ -n "$SETUP_CMD" ]; then eval "$SETUP_CMD"; fi
+          eval "$cmd"
+      - name: Run ${{ matrix.check }} (pwsh)
+        if: inputs.shell == 'pwsh'
+        shell: pwsh
+        run: &pwsh-check-run |
+          $cmd = switch ($env:CHECK) { 'lint' { $env:LINT_CMD } 'typecheck' { $env:TYPECHECK_CMD } default { $env:TEST_CMD } }
+          if (-not $cmd) { Write-Output "::notice::$($env:CHECK): no command in this repo's fleet profile; passing"; exit 0 }
+          if ($env:SETUP -notin @('none', 'python', 'node', 'dotnet')) { Write-Output "::error::Unsupported setup value"; exit 1 }
+          if ($env:SETUP_CMD) { Invoke-Expression $env:SETUP_CMD; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          Invoke-Expression $cmd
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run ${{ matrix.check }} (powershell)
+        if: inputs.shell == 'powershell'
+        shell: powershell
+        run: *pwsh-check-run

@@ -1,0 +1,581 @@
+name: ocr-reusable
+
+# Open Code Review (@alibaba-group/open-code-review) as the PR reviewer.
+# Provider: zai via the ZAI_API_KEY / ZAI_API_KEY_2 secrets. DUAL-KEY,
+# SAME-PROVIDER fallback: the primary key is picked per PR by number parity,
+# and any retryable failure (1302/429/overloaded, auth 401/403) moves the
+# next attempt to the other key. 3-attempt ladder with backoff. Total zai
+# failure exits red (zai-only policy: the fallback is the second key, never
+# another provider). With only one key set, both slots reuse it; with none,
+# the run fails closed.
+#
+# CALLER CONTRACT
+#   permissions (job level in the caller; callee cannot exceed them):
+#     contents: read
+#     pull-requests: write   # findings + receipt comments
+#     actions: write         # only used when `rerun-workflow` is set
+#   secrets:  ZAI_API_KEY (required), ZAI_API_KEY_2 (optional)
+#   triggers (caller owns them; keep `synchronize` OUT to avoid fix loops):
+#     pull_request: [opened, reopened, ready_for_review, labeled]
+#     workflow_dispatch: inputs pr (string, required), attempt (string, "0")
+#   concurrency (caller owns it). Per-PR group that queues repeats, with
+#     drafts and no-op labels on a unique run_id group so they never evict a
+#     pending review:
+#       group: ${{ (github.event.action == 'labeled' && github.event.label.name != 'ocr-rerun') && format('ocr-noop-{0}', github.run_id) || (github.event.pull_request.draft && format('ocr-draft-{0}', github.run_id) || format('ocr-pr-{0}', github.event.pull_request.number || inputs.pr)) }}
+#       cancel-in-progress: false
+#   `workflow_dispatch` is the manual override and may review a draft;
+#   automatic events (pull_request) never review drafts.
+#
+# SELF-DISPATCH RERUN (optional). On a provider-outage-only failure the job
+# can dispatch ONE capped rerun of the CALLER's workflow via
+# `gh workflow run`. That only works from the caller's own file, so set
+# `rerun-workflow` to the caller's file name (e.g. review.yml); that file must
+# declare workflow_dispatch inputs `pr` and `attempt`, and pass them back as
+# this workflow's `pr` / `attempt`. The attempt counter hard-stops the chain at
+# 3 reruns; a run-history count per head SHA is a secondary bound; both fail
+# closed. `gh workflow run` reads the DEFAULT branch's copy of that file.
+# Empty (default) = no self-dispatch: a provider outage just leaves the check
+# red until the rerun label is re-added.
+#
+# POST SCRIPT. Findings are posted by `post-script` (default
+# scripts/ocr_post_findings.py), read from origin/<base> and NEVER from the PR
+# head, so a PR cannot run code with the write token. It receives env
+# GH_TOKEN, PR, HEAD_SHA, REPO, BASE_REF and reads ocr's comments.json from
+# the workspace root. Missing from the base branch = the run fails closed.
+#
+# POSTURE: an agentic reviewer runs over PR content, typically on a
+# persistent self-hosted runner. Mitigations: callers use pull_request (never
+# pull_request_target), persist-credentials: false, and fork PRs are skipped
+# at execution time (their secrets are not injected anyway).
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'JSON runs-on label list, e.g. ["self-hosted","ocr"]'
+        type: string
+        required: true
+      timeout-minutes:
+        type: number
+        default: 120
+      pr:
+        description: PR number for workflow_dispatch callers (empty on pull_request)
+        type: string
+        default: ""
+      attempt:
+        description: Automatic-rerun chain counter (workflow_dispatch callers; humans leave unset)
+        type: string
+        default: "0"
+      rerun-label:
+        description: Label whose `labeled` event requests a review; any other label event is a no-op
+        type: string
+        default: ocr-rerun
+      skip-authors:
+        description: 'JSON list of PR author logins that are never reviewed, e.g. ["dependabot[bot]"]'
+        type: string
+        default: "[]"
+      skip-head-prefix:
+        description: Same-repo PRs whose head branch starts with this prefix are skipped (empty = off)
+        type: string
+        default: train/
+      skip-base-ref:
+        description: Restricts skip-head-prefix to PRs into this base branch (empty = any base)
+        type: string
+        default: main
+      exclude:
+        description: Comma-separated gitignore-style globs passed to `ocr review --exclude` (empty = none)
+        type: string
+        default: ""
+      model:
+        description: zai model name
+        type: string
+        default: glm-5.3
+      provider-url:
+        description: zai OpenAI-compatible endpoint
+        type: string
+        default: https://api.z.ai/api/coding/paas/v4
+      ocr-version:
+        description: Exact open-code-review npm version
+        type: string
+        default: 1.12.0
+      post-script:
+        description: Path (in the base branch) of the findings publisher
+        type: string
+        default: scripts/ocr_post_findings.py
+      rerun-workflow:
+        description: File name of the caller workflow to self-dispatch on provider outage (empty = off)
+        type: string
+        default: ""
+    secrets:
+      ZAI_API_KEY:
+        required: true
+      ZAI_API_KEY_2:
+        required: false
+
+permissions: {}
+
+jobs:
+  review:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write # only for the optional rerun self-dispatch
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # Draft guard: automatic events never review drafts (dispatch is the
+    # explicit manual override). Resolved again at execution time in the
+    # target step. `github.head_ref` is empty on dispatch, so the skip-prefix
+    # clause never fires there. startsWith(x, '') is true, hence the != ''.
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event.pull_request.draft == false &&
+         !contains(fromJSON(inputs.skip-authors), github.event.pull_request.user.login) &&
+         (github.event.action != 'labeled' || github.event.label.name == inputs.rerun-label) &&
+         !(inputs.skip-head-prefix != '' &&
+           startsWith(github.head_ref, inputs.skip-head-prefix) &&
+           (inputs.skip-base-ref == '' || github.event.pull_request.base.ref == inputs.skip-base-ref) &&
+           github.event.pull_request.head.repo.fork == false))
+      }}
+    steps:
+      - name: Resolve review target (head SHA, base ref, fork, draft, state)
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_PR: ${{ inputs.pr }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+          SKIP_AUTHORS: ${{ inputs.skip-authors }}
+        run: |
+          set -euo pipefail
+          # Homebrew paths exist only on macOS legs; gh is on PATH elsewhere.
+          case "$(uname -s)" in
+            Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+          esac
+          # Execution-time truth for BOTH event paths (dispatch has no PR
+          # payload; a queued run must not trust stale payload facts).
+          read -r sha base fork draft state skipauthor number < <(
+            gh pr view "${DISPATCH_PR}${PR_NUMBER}" --repo "$GITHUB_REPOSITORY" \
+              --json headRefOid,baseRefName,isCrossRepository,isDraft,state,author,number \
+              --jq '[.headRefOid, .baseRefName, .isCrossRepository, .isDraft, .state, (.author.login as $a | env.SKIP_AUTHORS | fromjson | any(.[]; . == $a)), .number] | @tsv'
+          )
+          # Dispatch has no requested head (github.sha is the dispatch ref,
+          # not the PR head): the live head resolved above is the target.
+          if [ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ] && [ "$sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR head moved since this review was requested ($EXPECTED_SHA -> $sha); refusing stale review target"
+            exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "base=$base"
+            echo "fork=$fork"
+            echo "draft=$draft"
+            echo "number=$number"
+            # Draft review is explicitly requested via dispatch, never automatic.
+            if [ "$fork" = "true" ] || { [ "$draft" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ]; } || [ "$state" != "OPEN" ] || [ "$skipauthor" = "true" ]; then
+              echo "run=false"
+            else
+              echo "run=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
+      - name: Skip (fork, automatic draft, not open, or skipped author)
+        if: steps.target.outputs.run != 'true'
+        shell: bash
+        run: |
+          echo "OCR review skipped -- fork/automatic-draft/non-OPEN/skipped-author resolved at execution time."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.target.outputs.run == 'true'
+        with:
+          # Review the PR head, not the auto-merge ref: findings' line numbers
+          # must match the head SHA used when posting inline comments.
+          ref: ${{ steps.target.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0 # OCR walks history for context
+      - name: Install pinned ocr CLI
+        if: steps.target.outputs.run == 'true'
+        shell: bash
+        env:
+          OCR_VERSION: ${{ inputs.ocr-version }}
+        run: | # zizmor: ignore[adhoc-packages] -- exact reviewer pin, scripts disabled, isolated temp prefix
+          set -euo pipefail
+          case "$(uname -s)" in
+            Darwin)
+              export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+              echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+              ;;
+          esac
+          # Always install the pinned version into runner temp: a host-installed
+          # or stale `ocr` on PATH must never shadow the pinned CLI.
+          export npm_config_prefix="$RUNNER_TEMP/ocr-tools"
+          mkdir -p "$npm_config_prefix"
+          # Never read registry/install configuration from the PR checkout.
+          install_dir=$(mktemp -d "$RUNNER_TEMP/ocr-install.XXXXXX")
+          trap 'rm -rf "$install_dir"' EXIT
+          cd "$install_dir"
+          # Exact reviewer version, scripts disabled, isolated runner-temp
+          # prefix; this review never judges merge readiness.
+          if command -v npm >/dev/null 2>&1; then
+            npm install -g --ignore-scripts "@alibaba-group/open-code-review@$OCR_VERSION"
+            echo "$npm_config_prefix/bin" >> "$GITHUB_PATH"
+            export PATH="$npm_config_prefix/bin:$PATH"
+          elif command -v bun >/dev/null 2>&1; then
+            # Bun ignores npm_config_prefix; set its own global dirs.
+            export BUN_INSTALL_GLOBAL_DIR="$RUNNER_TEMP/ocr-bun-global"
+            export BUN_INSTALL_BIN="$RUNNER_TEMP/ocr-bun-bin"
+            mkdir -p "$BUN_INSTALL_GLOBAL_DIR" "$BUN_INSTALL_BIN"
+            bun install -g --ignore-scripts "@alibaba-group/open-code-review@$OCR_VERSION"
+            echo "$BUN_INSTALL_BIN" >> "$GITHUB_PATH"
+            export PATH="$BUN_INSTALL_BIN:$PATH"
+          else
+            echo "::error::neither npm nor bun found on runner host" >&2
+            exit 1
+          fi
+          ocr --version
+      - name: Configure zai provider (dual key, ephemeral HOME)
+        if: steps.target.outputs.run == 'true'
+        shell: bash
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_API_KEY_2: ${{ secrets.ZAI_API_KEY_2 }}
+          OCR_HOME: ${{ runner.temp }}/ocr-home
+          OCR_MODEL: ${{ inputs.model }}
+          OCR_URL: ${{ inputs.provider-url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OCR_HOME/.opencodereview"
+          # Config files are written directly (no key on any argv / process
+          # list). Two KEY SLOTS under the ephemeral OCR_HOME: config-a.json
+          # holds ZAI_API_KEY, config-b.json holds ZAI_API_KEY_2; the review
+          # step copies the chosen slot onto config.json before each attempt.
+          # Single-key degrade: with EITHER key absent its slot mirrors the
+          # other, so no attempt ever runs keyless. Both empty: fail closed.
+          python3 - <<'PY'
+          import json, os
+          cfgdir = os.path.join(os.environ["OCR_HOME"], ".opencodereview")
+          key1 = os.environ.get("ZAI_API_KEY", "")
+          key2 = os.environ.get("ZAI_API_KEY_2", "")
+          if not key1 and not key2:
+              raise SystemExit(
+                  "both ZAI_API_KEY and ZAI_API_KEY_2 are empty (fail-closed): "
+                  "refusing to configure the zai provider without a key"
+              )
+          slot_a = key1 or key2
+          slot_b = key2 or key1
+          def write(name, key):
+              cfg = {
+                  "provider": "zai",
+                  "custom_providers": {
+                      "zai": {
+                          "api_key": key,
+                          "url": os.environ["OCR_URL"],
+                          "protocol": "openai",
+                          "model": os.environ["OCR_MODEL"],
+                      },
+                  },
+                  "llm": {},
+              }
+              # 0600: keys live only for this job under runner temp.
+              fd = os.open(os.path.join(cfgdir, name),
+                           os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              with os.fdopen(fd, "w") as f:
+                  json.dump(cfg, f)
+          write("config-a.json", slot_a)
+          write("config-b.json", slot_b)
+          # Canonical config the CLI reads; pre-created 0600 so every
+          # per-attempt slot copy lands on an existing 0600 file.
+          fd = os.open(os.path.join(cfgdir, "config.json"),
+                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          os.close(fd)
+          PY
+      - name: Run OCR review
+        if: steps.target.outputs.run == 'true'
+        id: ocr
+        shell: bash
+        env:
+          OCR_HOME: ${{ runner.temp }}/ocr-home
+          # Pass refs via env, never interpolated into the script body.
+          BASE_REF: ${{ steps.target.outputs.base }}
+          PR_NUMBER: ${{ steps.target.outputs.number }}
+          RERUN_ATTEMPT: ${{ inputs.attempt }}
+          RERUN_WORKFLOW: ${{ inputs.rerun-workflow }}
+          OCR_MODEL: ${{ inputs.model }}
+          EXCLUDES: ${{ inputs.exclude }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export HOME="$OCR_HOME"
+          BASE="origin/$BASE_REF"
+          # Dual-key slots (same provider): slot a holds ZAI_API_KEY, slot b
+          # ZAI_API_KEY_2. The PRIMARY slot is picked by PR-number parity
+          # (odd -> a, even -> b) so concurrent reviews spread across both
+          # keys; the ladder then alternates slots per attempt, so any
+          # retryable failure lands on the OTHER key.
+          number="${PR_NUMBER:-0}"
+          case $((number % 2)) in
+            1) primary=a; fallback=b ;;
+            *) primary=b; fallback=a ;;
+          esac
+          use_slot() {
+            # File-to-file copy: the key never appears on argv.
+            cp "$OCR_HOME/.opencodereview/config-$1.json" "$OCR_HOME/.opencodereview/config.json"
+          }
+          # Single-key degrade writes the SAME key into both slots; only
+          # distinct keys make a cross-key retry of a hard failure useful.
+          distinct_keys=0
+          cmp -s "$OCR_HOME/.opencodereview/config-a.json" \
+                 "$OCR_HOME/.opencodereview/config-b.json" || distinct_keys=1
+          exclude_args=()
+          if [ -n "$EXCLUDES" ]; then exclude_args=(--exclude "$EXCLUDES"); fi
+          run_review() {
+            rm -f ocr-out.json ocr-err.log   # never classify against a prior attempt's files
+            ocr review --from "$BASE" --to HEAD \
+              --provider zai --model "$OCR_MODEL" \
+              ${exclude_args[@]+"${exclude_args[@]}"} \
+              --audience agent --format json -o ocr-out.json 2> ocr-err.log
+          }
+          # Retry ladder: 3 attempts with backoff, fail only after the last.
+          # Attempt parity picks the slot (1=primary, 2=other, 3=primary).
+          attempt=0
+          ok=0
+          while [ "$attempt" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            if [ $((attempt % 2)) -eq 1 ]; then slot=$primary; else slot=$fallback; fi
+            use_slot "$slot"
+            echo "::group::ocr review attempt $attempt/3 ($OCR_MODEL, key slot $slot)"
+            if run_review; then
+              ok=1
+              echo "::endgroup::"
+              break
+            else
+              # Capture ocr's status inside the else branch: a bare failed `if`
+              # with no executed branch yields 0 (POSIX), losing the real rc.
+              rc=$?
+            fi
+            echo "::endgroup::"
+            # grep -Eq: POSIX ERE, identical on BSD and GNU grep. Retryable
+            # classes come from captured stderr (survives no-report crashes)
+            # plus a tight provider-error pattern in the report:
+            #   transient: 1302 / HTTP 429 / overloaded (digit-bounded)
+            #   auth:      HTTP 40[13] and provider "code" 40[13]
+            #              (digit-bounded), invalid-key / unauthorized text
+            # Both classes switch to the OTHER key on the next attempt. A
+            # HARD failure ("all N file review(s) failed") matches no
+            # retryable pattern and gets exactly ONE attempt on the other
+            # key, and only when the keys differ.
+            retry_re='"code"[: ]*"?1302([^0-9]|$)|HTTP 429|overloaded|(^|[^0-9])40[13]([^0-9]|$)|invalid.*key|unauthori[sz]ed'
+            if grep -Eq "$retry_re" ocr-err.log 2>/dev/null \
+               || grep -Eq "$retry_re" ocr-out.json 2>/dev/null; then
+              [ "$attempt" -ge 3 ] && break
+              sleep $((attempt * 45))
+            elif [ "$attempt" -eq 1 ] && [ "$distinct_keys" -eq 1 ]; then
+              sleep 30
+            else
+              break
+            fi
+          done
+          # Bounded automatic rerun on provider-outage exhaustion (optional).
+          # TRANSIENT-ONLY class (1302 / HTTP 429 / overloaded); auth 401/403
+          # and hard verdicts are NOT outages and stay red. Classification
+          # reads ocr-err.log ONLY: a content echo of "HTTP 429" in the
+          # report must not classify. A dispatched retry is not a completed
+          # review: the publication guard keeps this job non-successful.
+          transient_re='"code"[: ]*"?1302([^0-9]|$)|HTTP 429|overloaded'
+          if [ "$ok" -ne 1 ] && [ -n "$RERUN_WORKFLOW" ] && grep -Eq "$transient_re" ocr-err.log 2>/dev/null; then
+            HEAD_SHA=$(git rev-parse HEAD)
+            export HEAD_SHA
+            # FAIL CLOSED: a failed run-history count must never authorize a
+            # rerun, so it counts as the cap being reached.
+            count_failed=0
+            if ! same_head=$(gh run list --workflow "$RERUN_WORKFLOW" \
+              --repo "$GITHUB_REPOSITORY" --event pull_request --limit 100 \
+              --json headSha,conclusion --jq '[.[] | select(.headSha == env.HEAD_SHA and .conclusion != "skipped")] | length'); then
+              same_head=4
+              count_failed=1
+            fi
+            attempt="${RERUN_ATTEMPT:-0}"
+            if ! [[ "$attempt" =~ ^[0-9]+$ ]]; then
+              echo "::error::provider-outage rerun cap treated as reached (invalid attempt counter); leaving the check red" >&2
+              exit 1
+            fi
+            # Strip leading zeroes before arithmetic; bound length first
+            # so even an arbitrarily large decimal counter fails closed.
+            attempt="${attempt#"${attempt%%[!0]*}"}"
+            attempt="${attempt:-0}"
+            if [ "${#attempt}" -gt 1 ] || [ "$attempt" -ge 3 ]; then
+              echo "::error::provider-outage dispatch-chain cap reached (attempt >= 3); leaving the check red" >&2
+              exit 1
+            fi
+            if [ "${same_head:-0}" -lt 4 ]; then
+              echo "::warning::provider outage exhausted the dual-key ladder (dispatch-chain attempt ${attempt}/3; non-skipped pull_request-event runs for this head: ${same_head:-0}/4 secondary bound); dispatching a capped rerun after backoff" >&2
+              sleep 120
+              # Events created by GITHUB_TOKEN fire no workflow run;
+              # workflow_dispatch is the one trigger this token may create.
+              gh workflow run "$RERUN_WORKFLOW" --repo "$GITHUB_REPOSITORY" -f pr="$PR_NUMBER" -f attempt="$((attempt + 1))"
+              echo "rerun=scheduled" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$count_failed" -eq 1 ]; then
+              echo "::error::provider-outage rerun cap treated as reached (run-history count failed); leaving the check red" >&2
+            else
+              echo "::error::provider-outage secondary cap reached for this head (${same_head:-0} non-skipped pull_request-event runs); leaving the check red" >&2
+            fi
+          fi
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::ocr review failed on zai after the 3-attempt dual-key ladder (rc=${rc:-unknown}); no fallback provider (zai-only policy)" >&2
+            # Dump a bounded stderr excerpt before later cleanup deletes
+            # ocr-err.log unread. GitHub redacts registered secrets from the
+            # step log. Cap: 50 lines / 8KiB. `{...} || true` swallows SIGPIPE
+            # under pipefail when head -c closes early.
+            if [ -f ocr-err.log ]; then
+              echo "ocr-err.log excerpt (max 50 lines / 8KiB):" >&2
+              { sed -n '1,50p' ocr-err.log | head -c 8192; } >&2 || true
+              echo >&2
+            fi
+            exit "${rc:-1}"
+          fi
+          python3 - <<'PY'
+          import json, os
+          raw = open('ocr-out.json').read()
+          # Output may be preceded/followed by progress lines; decode the last
+          # complete JSON object defensively (plain rfind+loads breaks on any
+          # trailing data). Prefer the OUTERMOST object: raw_decode at the first
+          # '{' of a document consumes the whole thing, so the earliest
+          # successful decode in the tail-most document region is the report.
+          def span_end(text, start):
+              # End (exclusive) of the object opening at text[start]; -1 when it
+              # never closes. Braces inside JSON strings never nest.
+              depth = 0
+              in_str = False
+              esc = False
+              for j in range(start, len(text)):
+                  c = text[j]
+                  if in_str:
+                      if esc:
+                          esc = False
+                      elif c == '\\':
+                          esc = True
+                      elif c == '"':
+                          in_str = False
+                  elif c == '"':
+                      in_str = True
+                  elif c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return j + 1
+              return -1
+
+          def unique_object(pairs):
+              obj = {}
+              for key, value in pairs:
+                  if key in obj:
+                      raise SystemExit('duplicate JSON key in OCR output')
+                  obj[key] = value
+              return obj
+          decoder = json.JSONDecoder(object_pairs_hook=unique_object)
+          best = None
+          i = 0
+          while i < len(raw):
+              if raw[i] != '{':
+                  i += 1
+                  continue
+              try:
+                  obj, stop = decoder.raw_decode(raw, i)
+              except json.JSONDecodeError:
+                  # Malformed/incomplete object opening here. Never resume
+                  # scanning inside its span: a truncated envelope's nested
+                  # {"comments":[]} must not become the report. If the span
+                  # starts a JSON property (including escaped keys), or carries
+                  # report/failure keys, refuse it rather than decode inside it.
+                  end = span_end(raw, i)
+                  span = raw[i:] if end < 0 else raw[i:end]
+                  if span[1:].lstrip().startswith('"') or any(f'"{key}"' in span for key in ('status', 'summary', 'comments', 'error', 'errors', 'success')):
+                      raise SystemExit('malformed OCR report envelope in output - refusing to resume inside it')
+                  i = len(raw) if end < 0 else end
+                  continue
+              # Skip past the decoded span: nested objects inside it must never
+              # override the outer document (raw_decode stops at its own brace).
+              i = stop
+              # Failure envelope (workflow decode leg of the 2026-10-24
+              # receipt contract): ANY complete envelope that explicitly
+              # says it failed must red the run BEFORE its metadata is
+              # discarded into a publishable list - selectable or not, and
+              # before any later clean object is selected in its place.
+              if obj.get('error') or obj.get('errors') or obj.get('success') is False or str(obj.get('status', '')).strip().lower() in ('error', 'failed', 'failure', 'cancelled', 'canceled'):
+                  raise SystemExit('OCR report indicates failure - rejecting the report')
+              if any(key in obj for key in ('comments', 'summary', 'status')):
+                  comments = obj.get('comments')
+                  if not isinstance(comments, list):
+                      raise SystemExit('OCR report must contain an explicit comments list')
+                  if any(not isinstance(c, dict) or not isinstance(c.get('content'), str) or not c['content'].strip() for c in comments):
+                      raise SystemExit('OCR findings must contain nonempty textual content')
+                  best = obj
+          if best is None:
+              raise SystemExit('no OCR report object found in output')
+          comments = best['comments']
+          # An explicit empty list is a VALID report: findings=0 still writes
+          # comments.json and the posting step below still runs, because a
+          # zero-finding review must earn its receipt like any other.
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"findings={len(comments)}\n")
+          with open('comments.json', 'w') as f:
+              json.dump(comments, f)
+          PY
+      # Publisher runs for EVERY successful review, including zero findings:
+      # the receipt contract (final bot-comment marker line naming the
+      # reviewed head and the outstanding blocking count) must exist for a
+      # clean head too. Skips only the neutral provider-outage rerun leg
+      # (rerun=scheduled exits 0 with no comments.json) and failed OCR steps.
+      - name: Post findings as PR comments (deduped per commit)
+        if: ${{ steps.target.outputs.run == 'true' && steps.ocr.outputs.rerun != 'scheduled' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.target.outputs.number }}
+          HEAD_SHA: ${{ steps.target.outputs.sha }}
+          REPO: ${{ github.repository }}
+          # Resolved output: github.base_ref is empty on workflow_dispatch.
+          BASE_REF: ${{ steps.target.outputs.base }}
+          POST_SCRIPT: ${{ inputs.post-script }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "origin/$BASE_REF:$POST_SCRIPT" 2>/dev/null; then
+            echo "::error::$POST_SCRIPT absent from origin/$BASE_REF - refusing review completion (trust boundary: no PR-head execution with write token); findings are in this run's log."
+            exit 1
+          fi
+          git show "origin/$BASE_REF:$POST_SCRIPT" > "$RUNNER_TEMP/ocr_post_findings.py"
+          python3 "$RUNNER_TEMP/ocr_post_findings.py"
+        id: publish
+      - name: Scrub ephemeral key material
+        if: ${{ always() && steps.target.outputs.run == 'true' }}
+        shell: bash
+        env:
+          OCR_HOME: ${{ runner.temp }}/ocr-home
+        run: |
+          rm -rf "$OCR_HOME" "$RUNNER_TEMP/ocr-tools" "$RUNNER_TEMP/ocr-bun-global" "$RUNNER_TEMP/ocr-bun-bin"
+          rm -f "$GITHUB_WORKSPACE/ocr-out.json" "$GITHUB_WORKSPACE/ocr-err.log" "$GITHUB_WORKSPACE/comments.json"
+      - name: Summary
+        if: steps.target.outputs.run == 'true'
+        shell: bash
+        env:
+          OCR_FINDINGS: ${{ steps.ocr.outputs.findings }}
+          OCR_RERUN: ${{ steps.ocr.outputs.rerun }}
+          OCR_MODEL: ${{ inputs.model }}
+        run: |
+          if [ "${OCR_RERUN:-}" = "scheduled" ]; then
+            echo "OCR review: provider outage - automatic workflow_dispatch rerun scheduled (capped per head); this run is incomplete, not a successful review"
+          else
+            echo "OCR review: ${OCR_FINDINGS:-0} finding(s) via zai/$OCR_MODEL"
+          fi
+      - name: Require completed review publication
+        if: ${{ always() && steps.target.outputs.run == 'true' }}
+        shell: bash
+        env:
+          PUBLISH_RESULT: ${{ steps.publish.outcome }}
+        run: |
+          if [ "$PUBLISH_RESULT" != success ]; then
+            echo "Review incomplete: no successful trusted-base publication" >&2
+            exit 1
+          fi

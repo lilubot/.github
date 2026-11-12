@@ -1,0 +1,148 @@
+name: security-reusable
+
+# Fleet CI standard L1 security (workflow-audit-2026-11-06 §4.1, §4.5):
+# checks `<caller job> / zizmor|gitleaks|osv|trivy`. Scanners are pinned by
+# version AND sha256 (same pins as nima-core scripts/ci/fetch_scanners.sh)
+# and installed into $RUNNER_TEMP; the runner must be Linux x86_64 with curl.
+# Repo config is used when present: .gitleaks.toml, .gitleaksignore,
+# osv-scanner.toml. Drafts are skipped unless labelled `draft-label`.
+# Caller grants: contents: read. Concurrency is the caller's.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON label list for runs-on (Linux x86_64), e.g. '["self-hosted","nima-fast"]'
+        type: string
+        required: true
+      zizmor-paths:
+        description: Paths zizmor audits
+        type: string
+        default: .github/workflows
+      trivy:
+        description: Also run trivy fs (HIGH/CRITICAL, fixed vulns only)
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 15
+      draft-label:
+        type: string
+        default: batch-candidate
+
+permissions: {}
+
+jobs:
+  zizmor:
+    if: &not-draft github.event_name != 'pull_request' || github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, inputs.draft-label)
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      - name: zizmor
+        shell: bash
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-zizmor-cache
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-zizmor-tools
+          ZIZMOR_PATHS: ${{ inputs.zizmor-paths }}
+        run: |
+          read -ra paths <<<"$ZIZMOR_PATHS"
+          uvx --refresh zizmor@1.30.1 "${paths[@]}"
+
+  gitleaks:
+    if: *not-draft
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - &fetch
+        name: Install pinned scanner
+        shell: bash
+        env:
+          TOOL: ${{ github.job }}
+        run: |
+          set -euo pipefail
+          [ "$(uname -s)/$(uname -m)" = Linux/x86_64 ] || { echo "::error::security.yml scanners need Linux/x86_64, got $(uname -s)/$(uname -m)"; exit 1; }
+          root="$RUNNER_TEMP/scanners"; bin="$root/bin"; mkdir -p "$bin"
+          fetch() { curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$root/dl.part" "$1"; echo "$2  $root/dl.part" | sha256sum -c --quiet -; mv "$root/dl.part" "$root/$3"; }
+          case "$TOOL" in
+            gitleaks) fetch https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb t.tgz
+                      tar -xzf "$root/t.tgz" -C "$bin" gitleaks ;;
+            osv)      fetch https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b osv
+                      install -m 0755 "$root/osv" "$bin/osv-scanner" ;;
+            trivy)    fetch https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f t.tgz
+                      tar -xzf "$root/t.tgz" -C "$bin" trivy ;;
+            *) echo "::error::no scanner for job $TOOL"; exit 1 ;;
+          esac
+          echo "$bin" >>"$GITHUB_PATH"
+      - name: Scan new commits
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) range="$PR_BASE..$PR_HEAD" ;;
+            push)
+              if [[ "$PUSH_BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then range=""
+              else range="$PUSH_BEFORE..$SHA"; fi ;;
+            *) range="" ;;  # schedule / dispatch: full history
+          esac
+          args=(git --no-banner --redact --exit-code 1)
+          [ -f .gitleaks.toml ] && args+=(--config .gitleaks.toml)
+          [ -f .gitleaksignore ] && args+=(--gitleaks-ignore-path .gitleaksignore)
+          [ -n "$range" ] && args+=(--log-opts="$range")
+          echo "gitleaks range: ${range:-<full history>}"
+          gitleaks "${args[@]}" .
+
+  osv:
+    if: *not-draft
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - *fetch
+      - name: osv-scanner
+        shell: bash
+        run: |
+          args=(scan source --recursive)
+          [ -f osv-scanner.toml ] && args+=(--config osv-scanner.toml)
+          rc=0; osv-scanner "${args[@]}" . || rc=$?
+          # 128 = no lockfile/manifest to scan: nothing vulnerable to report.
+          if [ "$rc" -eq 128 ]; then echo "::notice::osv-scanner: no package sources in this repo"; exit 0; fi
+          exit "$rc"
+
+  trivy:
+    if: inputs.trivy && (github.event_name != 'pull_request' || github.event.pull_request.draft == false || contains(github.event.pull_request.labels.*.name, inputs.draft-label))
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - *fetch
+      - name: trivy fs (vuln)
+        shell: bash
+        run: trivy fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --skip-dirs node_modules .

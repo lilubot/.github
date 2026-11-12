@@ -1,0 +1,365 @@
+name: heavy-reusable
+
+# Fleet CI standard L2/L3 (workflow-audit-2026-11-06 §4.1, §4.3): the heavy
+# battery runs ONCE per git tree. Jobs:
+#   verdict  (control runner) lane check -> runner-pool check -> tree lookup
+#   <leg>    (matrix, one job per leg on that leg's own runner) only on a miss
+#   post     commit status `verdict/heavy` = "tree=<T>" on the PR head (or the
+#            pushed SHA); on a hit it re-stamps the original run's URL
+#   gate     the ONE check to require (`<caller job> / gate`): passes only on a
+#            reuse hit or when every leg passed. Never require the legs
+#            themselves: a refused lane skips them, and skipped = green.
+#
+# Runner-agnostic: no runner label is hard-coded. `control-runner` and each
+# leg's `runner` are JSON label lists from the caller (the repo's fleet
+# profile). A self-hosted pool with 0 online runners fails `verdict` in
+# seconds (needs `runner-read-token`: a token with Administration: read on
+# the repo; without it the check is skipped with a warning).
+#
+# legs: JSON list, one object per leg:
+#   name     (required) check name, e.g. "linux"
+#   runner   (required) runs-on label list, e.g. ["self-hosted","nima-linux"]
+#   cmd      (required) command, run with `shell`
+#   timeout  minutes, default 60 (fleet rule: <= 2x p90)
+#   shell    bash (default) | pwsh | powershell (Windows PowerShell 5.1)
+#   setup    none (default) | python (uv) | node | dotnet
+#   setup-version  version for setup (node/dotnet/python), optional
+#   setup-cmd      extra toolchain command before cmd (rustup, godot, ...)
+#   fetch-depth    checkout depth, default 1 (0 = full history)
+#   artifacts      path glob uploaded on every outcome (junit, durations)
+# lanes: JSON map base-branch -> ERE. A PR into a mapped base runs heavy only
+# from a same-repo head matching it and FAILS CLOSED otherwise; unmapped
+# bases run heavy on every PR. Push/dispatch always run (or reuse).
+#
+# Caller grants: contents: read, statuses: write, pull-requests: read,
+# actions: read. Concurrency is the caller's.
+
+on:
+  workflow_call:
+    inputs:
+      control-runner:
+        description: JSON label list for verdict/post/gate (the fast pool), e.g. '["self-hosted","nima-fast"]'
+        type: string
+        required: true
+      legs:
+        description: JSON list of {name, runner, cmd, timeout?, shell?, setup?, setup-version?, setup-cmd?, fetch-depth?, artifacts?}
+        type: string
+        required: true
+      lanes:
+        description: 'JSON map base -> ERE for admitted head branches, e.g. {"next":"^(lilubot/batch-|hotfix/)","main":"^train/"}'
+        type: string
+        default: "{}"
+      verdict-context:
+        description: Commit-status context that carries the tree verdict
+        type: string
+        default: verdict/heavy
+    secrets:
+      runner-read-token:
+        description: Token with Administration read on the repo, for the runner-pool check (optional)
+        required: false
+    outputs:
+      hit:
+        description: "'true' when an earlier run's verdict for this tree was reused"
+        value: ${{ jobs.verdict.outputs.hit }}
+      tree:
+        description: Git tree SHA of the commit under test
+        value: ${{ jobs.verdict.outputs.tree }}
+
+permissions: {}
+
+jobs:
+  verdict:
+    runs-on: ${{ fromJSON(inputs.control-runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: read
+      pull-requests: read
+      actions: read
+    outputs:
+      lane: ${{ steps.lane.outputs.lane }}
+      run: ${{ steps.lane.outputs.lane == 'run' && steps.lookup.outputs.hit != 'true' }}
+      hit: ${{ steps.lookup.outputs.hit }}
+      tree: ${{ steps.lookup.outputs.tree }}
+      url: ${{ steps.lookup.outputs.url }}
+    steps:
+      - &helper
+        name: Install fleet-ci helper
+        shell: bash
+        run: |
+          cat >"$RUNNER_TEMP/fleet-ci.sh" <<'FLEETCI'
+          # BEGIN fleet-ci.sh
+          #!/usr/bin/env bash
+          # fleet-ci helper: heavy-lane decisions and tree-SHA verdict reuse
+          # (fleet CI standard §4.3). heavy.yml embeds a byte-identical copy between
+          # its BEGIN/END markers (a reusable workflow cannot read this repo's files);
+          # tests/fleet-ci.test.sh fails when the copies drift.
+          #
+          # Usage: fleet-ci.sh <lane|pools|lookup|post|gate>; inputs via env, results
+          # as key=value lines on stdout (append to $GITHUB_OUTPUT). Needs bash + gh.
+          set -euo pipefail
+
+          # Workflow commands (::error::) are parsed from stderr too; stdout carries
+          # only key=value results for $GITHUB_OUTPUT.
+          die() { echo "::error::$*" >&2; exit 1; }
+
+          # lane: EVENT BASE_REF HEAD_REF SAME_REPO DRAFT LANE_RE -> lane=run|skip|refuse
+          # LANE_RE is the caller's regex for this PR's base (empty: every head runs).
+          fleet_lane() {
+            case "${EVENT:-}" in pull_request|pull_request_target) ;; *) echo lane=run; return ;; esac
+            if [ "${DRAFT:-false}" = true ]; then echo lane=skip; return; fi
+            if [ -z "${LANE_RE:-}" ]; then echo lane=run; return; fi
+            if [ "${SAME_REPO:-false}" = true ] && [[ "${HEAD_REF:-}" =~ $LANE_RE ]]; then echo lane=run; return; fi
+            echo "::error::${BASE_REF:-?} accepts heavy-lane PRs only from same-repo heads matching ${LANE_RE}; '${HEAD_REF:-}' is refused (fail closed: a skipped heavy run would count as green)" >&2
+            echo lane=refuse
+          }
+
+          # pools: REPO POOLS (JSON list of label lists) GH_TOKEN (Administration: read).
+          # Fails when a self-hosted pool has 0 online runners, so a leg errors in
+          # seconds instead of queueing for GitHub's 24 h limit. GitHub-hosted pools
+          # (no "self-hosted" label) are not checked. No token: warn, skip the check.
+          fleet_pools() {
+            if [ -z "${GH_TOKEN:-}" ]; then
+              echo "::warning::runner-read-token not set: cannot verify runner pools are online; an offline pool will queue, not fail" >&2
+              return 0
+            fi
+            local rows bad=0 n pool
+            rows=$(gh api "repos/$REPO/actions/runners?per_page=100" --paginate --slurp --jq "
+              [.[].runners[] | select(.status == \"online\") | [.labels[].name | ascii_downcase]] as \$on
+              | ${POOLS} | .[] | map(ascii_downcase) as \$p
+              | if (\$p | index(\"self-hosted\")) == null then empty
+                else \"\([\$on[] | select(. as \$l | \$p | all(. as \$x | \$l | index(\$x) != null))] | length)\t\(\$p | join(\",\"))\" end") \
+              || die "runner pool check failed (token needs Administration: read on $REPO)"
+            while IFS=$'\t' read -r n pool; do
+              [ -n "$n" ] || continue
+              if [ "$n" -eq 0 ]; then echo "::error::runner pool [$pool] has 0 online runners in $REPO: the leg would queue forever; bring a runner online or change the repo's fleet profile" >&2; bad=1
+              else echo "runner pool [$pool]: $n online" >&2; fi
+            done <<<"$rows"
+            return "$bad"
+          }
+
+          tree_of() {
+            local t
+            t=$(gh api "repos/$REPO/git/commits/$1" --jq .tree.sha) || return 1
+            [[ "$t" =~ ^[0-9a-f]{40}$ ]] || return 1
+            echo "$t"
+          }
+
+          # lookup: REPO SHA HEAD_SHA RUN_ID SERVER_URL CONTEXT -> tree=T hit=true|false url=U
+          # A verdict is a CONTEXT commit status by github-actions[bot], state success,
+          # description "tree=T", whose target_url is a run of this same workflow file
+          # in this repo that concluded success (or is this run). Candidates: SHA,
+          # HEAD_SHA and the heads of PRs containing either (a squash on next points
+          # back at its batch PR). Any API error or doubt is a miss; a miss runs heavy.
+          fleet_lookup() {
+            local tree c url id path concl my_path cands=() seen=" "
+            tree=$(tree_of "$SHA") || die "cannot read the tree of $SHA"
+            echo "tree=$tree"
+            my_path=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq .path 2>/dev/null) || { echo hit=false; return 0; }
+            for c in "$SHA" "${HEAD_SHA:-}"; do
+              [ -n "$c" ] || continue
+              cands+=("$c")
+              while read -r h; do [ -n "$h" ] && cands+=("$h"); done < <(gh api "repos/$REPO/commits/$c/pulls" --jq '.[].head.sha' 2>/dev/null || true)
+            done
+            for c in "${cands[@]}"; do
+              case "$seen" in *" $c "*) continue ;; esac
+              seen="$seen$c "
+              while read -r url; do
+                [[ "$url" =~ ^"$SERVER_URL/$REPO/actions/runs/"([0-9]+)$ ]] || continue
+                id=${BASH_REMATCH[1]}
+                read -r path concl < <(gh api "repos/$REPO/actions/runs/$id" --jq '"\(.path) \(.conclusion)"' 2>/dev/null || echo "- -")
+                [ "$path" = "$my_path" ] || continue
+                if [ "$concl" = success ] || [ "$id" = "$RUN_ID" ]; then
+                  echo "::notice::heavy verdict reused: tree $tree passed in $url (status on $c)" >&2
+                  echo hit=true
+                  echo "url=$url"
+                  return 0
+                fi
+              done < <(gh api "repos/$REPO/commits/$c/statuses?per_page=100" --jq ".[] | select(.context == \"$CONTEXT\" and .state == \"success\" and .creator.login == \"github-actions[bot]\" and .description == \"tree=$tree\") | .target_url" 2>/dev/null || true)
+            done
+            echo hit=false
+          }
+
+          # post: REPO SHA TREE CONTEXT URL. Best effort: a failed post only costs the
+          # next lane a rerun (fork PRs have a read-only token and always land here).
+          fleet_post() {
+            [[ "$TREE" =~ ^[0-9a-f]{40}$ ]] || die "post: bad tree '$TREE'"
+            if gh api -X POST "repos/$REPO/statuses/$SHA" -f state=success -f context="$CONTEXT" \
+                -f description="tree=$TREE" -f target_url="$URL" >/dev/null; then
+              echo "posted $CONTEXT tree=$TREE on $SHA" >&2
+            else
+              echo "::warning::could not post $CONTEXT on $SHA; the next lane will rerun heavy" >&2
+            fi
+          }
+
+          # gate: VERDICT_RESULT LANE HIT LEGS_RESULT -> exit 0 only when proven.
+          fleet_gate() {
+            [ "${VERDICT_RESULT:-}" = success ] || die "heavy verdict job ${VERDICT_RESULT:-missing}: lane refused, runner pool offline or lookup error (see the verdict job)"
+            case "${LANE:-}" in
+              skip) echo "::notice::draft PR: heavy not run; it runs on ready_for_review" >&2; return 0 ;;
+              run) ;;
+              *) die "unknown lane '${LANE:-}'" ;;
+            esac
+            if [ "${HIT:-}" = true ]; then echo "heavy: verdict reused" >&2; return 0; fi
+            [ "${LEGS_RESULT:-}" = success ] || die "heavy legs ${LEGS_RESULT:-missing}"
+            echo "heavy: all legs passed" >&2
+          }
+
+          if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+            case "${1:-}" in
+              lane) fleet_lane ;; pools) fleet_pools ;; lookup) fleet_lookup ;;
+              post) fleet_post ;; gate) fleet_gate ;;
+              *) echo "usage: $0 <lane|pools|lookup|post|gate>" >&2; exit 2 ;;
+            esac
+          fi
+          # END fleet-ci.sh
+          FLEETCI
+      - name: Lane
+        id: lane
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
+          LANE_RE: ${{ fromJSON(inputs.lanes)[github.base_ref] }}
+        run: |
+          out=$(bash "$RUNNER_TEMP/fleet-ci.sh" lane)
+          echo "$out" >>"$GITHUB_OUTPUT"
+          [ "$out" != lane=refuse ]
+      - name: Runner pools online
+        if: steps.lane.outputs.lane == 'run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.runner-read-token }}
+          REPO: ${{ github.repository }}
+          POOLS: ${{ toJSON(fromJSON(inputs.legs).*.runner) }}
+        run: bash "$RUNNER_TEMP/fleet-ci.sh" pools
+      - name: Tree verdict lookup
+        id: lookup
+        if: steps.lane.outputs.lane == 'run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          CONTEXT: ${{ inputs.verdict-context }}
+        run: bash "$RUNNER_TEMP/fleet-ci.sh" lookup | tee -a "$GITHUB_OUTPUT"
+
+  leg:
+    needs: verdict
+    if: needs.verdict.outputs.run == 'true'
+    name: ${{ matrix.leg.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(inputs.legs) }}
+    runs-on: ${{ matrix.leg.runner }}
+    timeout-minutes: ${{ matrix.leg.timeout || 60 }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ format('{0}', matrix.leg['fetch-depth']) || 1 }}
+      - if: matrix.leg.setup == 'python'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.leg['setup-version'] }}
+          enable-cache: false
+      - if: matrix.leg.setup == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.leg['setup-version'] || 'lts/*' }}
+      - if: matrix.leg.setup == 'dotnet'
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ matrix.leg['setup-version'] }}
+      - name: Toolchain (bash)
+        if: matrix.leg['setup-cmd'] && matrix.leg.shell != 'pwsh' && matrix.leg.shell != 'powershell'
+        shell: bash
+        env:
+          SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
+        run: eval "$SETUP_CMD"
+      - name: Toolchain (pwsh)
+        if: matrix.leg['setup-cmd'] && matrix.leg.shell == 'pwsh'
+        shell: pwsh
+        env:
+          SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
+        run: Invoke-Expression $env:SETUP_CMD
+      - name: Toolchain (powershell)
+        if: matrix.leg['setup-cmd'] && matrix.leg.shell == 'powershell'
+        shell: powershell
+        env:
+          SETUP_CMD: ${{ matrix.leg['setup-cmd'] }}
+        run: Invoke-Expression $env:SETUP_CMD
+      - name: Run ${{ matrix.leg.name }} (bash)
+        if: matrix.leg.shell != 'pwsh' && matrix.leg.shell != 'powershell'
+        shell: bash
+        env:
+          LEG_CMD: ${{ matrix.leg.cmd }}
+        run: eval "$LEG_CMD"
+      - name: Run ${{ matrix.leg.name }} (pwsh)
+        if: matrix.leg.shell == 'pwsh'
+        shell: pwsh
+        env:
+          LEG_CMD: ${{ matrix.leg.cmd }}
+        run: |
+          Invoke-Expression $env:LEG_CMD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run ${{ matrix.leg.name }} (powershell)
+        if: matrix.leg.shell == 'powershell'
+        shell: powershell
+        env:
+          LEG_CMD: ${{ matrix.leg.cmd }}
+        run: |
+          Invoke-Expression $env:LEG_CMD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - if: always() && matrix.leg.artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: heavy-${{ matrix.leg.name }}-${{ github.run_attempt }}
+          path: ${{ matrix.leg.artifacts }}
+          if-no-files-found: warn
+
+  post:
+    needs: [verdict, leg]
+    if: ${{ !cancelled() && needs.verdict.result == 'success' && needs.verdict.outputs.lane == 'run' && (needs.verdict.outputs.hit == 'true' || needs.leg.result == 'success') }}
+    runs-on: ${{ fromJSON(inputs.control-runner) }}
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - *helper
+      - name: Post tree verdict
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TREE: ${{ needs.verdict.outputs.tree }}
+          CONTEXT: ${{ inputs.verdict-context }}
+          URL: ${{ needs.verdict.outputs.hit == 'true' && needs.verdict.outputs.url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        run: bash "$RUNNER_TEMP/fleet-ci.sh" post
+
+  gate:
+    needs: [verdict, leg, post]
+    if: always()
+    runs-on: ${{ fromJSON(inputs.control-runner) }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - *helper
+      - name: Heavy gate
+        shell: bash
+        env:
+          VERDICT_RESULT: ${{ needs.verdict.result }}
+          LANE: ${{ needs.verdict.outputs.lane }}
+          HIT: ${{ needs.verdict.outputs.hit }}
+          LEGS_RESULT: ${{ needs.leg.result }}
+        run: bash "$RUNNER_TEMP/fleet-ci.sh" gate

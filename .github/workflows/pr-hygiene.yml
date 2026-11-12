@@ -1,0 +1,423 @@
+name: pr-hygiene-reusable
+
+# Fleet PR hygiene (API-only bot jobs): draft-guard, merge-receipt,
+# merge-conflict. Meant for a pool that NEVER runs PR code (fleet-policy).
+# No job checks anything out: everything is `gh api` / the REST API, and event
+# data reaches scripts through env: only. The runner needs `gh` (draft-guard,
+# merge-receipt) and `python3` (merge-conflict) on PATH.
+#
+# Called from a pull_request_target / push / schedule / workflow_dispatch
+# workflow in the caller (that caller carries the zizmor `dangerous-triggers`
+# ignore: base-branch bytes only, no checkout). Jobs select themselves from
+# github.event_name / action, so one call per event set is enough:
+#   draft-guard    pull_request_target opened | reopened | ready_for_review
+#   merge-receipt  pull_request_target closed (merged only)
+#   merge-conflict pull_request_target opened | synchronize | reopened |
+#                  ready_for_review | edited, push, schedule, workflow_dispatch
+#
+# Permissions the CALLER must grant to the calling job (callee jobs narrow):
+#   draft-guard    contents: write (convertPullRequestToDraft is refused for
+#                  GITHUB_TOKEN without it, cli/cli#8910), pull-requests: write
+#   merge-receipt  pull-requests: write (receipt comment), contents: read
+#                  (confirms the merge commit exists)
+#   merge-conflict pull-requests: read, statuses: write
+# Concurrency is the caller's. Recommended: draft-guard + merge-receipt in a
+# per-PR group, cancel-in-progress false; merge-conflict in ONE global group,
+# cancel-in-progress false (the PR event and the scan both publish the same
+# commit status via a non-atomic GET-then-POST, so splitting the group lets an
+# older observation land after a newer one; the scan cron self-heals a
+# superseded pending run).
+# Unchanged merge-conflict state, description and target URL are not reposted.
+#
+# Draft-guard lanes that keep a PR ready (everything else is returned to
+# draft with a comment): same-repo head matching `ready-heads` (dated trains,
+# hotfix/*; a fork can name its branch anything, so fork heads never match),
+# a PR labelled `exempt-label` (checked on every trigger, so a late label
+# works: label, then `gh pr ready`), or an actor in `triage-users`. If an
+# automation App flips PRs to ready, its login MUST be in `triage-users`,
+# otherwise the guard returns that PR to draft immediately.
+#
+# NOT ported: nima-core's merged-fix-label. It is batch-blind (audit #14); the
+# C11 closeout applies `fix-merged-unconfirmed` to each member's closing refs.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: JSON label list for runs-on, e.g. '["self-hosted","fleet-policy"]'
+        type: string
+        required: true
+      draft-guard:
+        type: boolean
+        default: true
+      merge-receipt:
+        type: boolean
+        default: true
+      merge-conflict:
+        type: boolean
+        default: true
+      ready-heads:
+        description: ERE; same-repo head branches matching it stay ready. Empty disables the lane.
+        type: string
+        default: '^(train/[0-9]{4}-[0-9]{2}-[0-9]{2}(-[1-9][0-9]*)?|hotfix/.+)$'
+      exempt-label:
+        description: Label that keeps a PR ready. Empty disables the lane.
+        type: string
+        default: draft-exempt
+      triage-users:
+        description: Comma-separated logins (incl. [bot] Apps) allowed to mark PRs ready. Empty disables the lane.
+        type: string
+        default: ""
+      conflict-bases:
+        description: Comma-separated base branches merge-conflict reports on.
+        type: string
+        default: main,next
+      timeout-minutes:
+        description: Timeout for draft-guard and merge-receipt.
+        type: number
+        default: 5
+      conflict-timeout-minutes:
+        description: Timeout for merge-conflict (its retry pacing budget is 420 s).
+        type: number
+        default: 10
+
+permissions: {}
+
+jobs:
+  draft-guard:
+    if: >-
+      inputs.draft-guard && github.event_name == 'pull_request_target'
+      && contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)
+      && !github.event.pull_request.draft
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Return non-triage PRs to draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          ACTOR: ${{ github.event.sender.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          READY_HEADS: ${{ inputs.ready-heads }}
+          EXEMPT_LABEL: ${{ inputs.exempt-label }}
+          TRIAGE_USERS: ${{ inputs.triage-users }}
+        run: |
+          set -euo pipefail
+          # BEGIN draft-decision
+          draft_decision() {
+            local list=",${TRIAGE_USERS// /},"
+            if [[ "$DRAFT" == true ]]; then
+              echo "already draft" >&2; echo keep; return
+            fi
+            if [[ "$SAME_REPO" == true && -n "$READY_HEADS" && "$HEAD_REF" =~ $READY_HEADS ]]; then
+              echo "ready head $HEAD_REF" >&2; echo keep; return
+            fi
+            if [[ -n "$EXEMPT_LABEL" && ",$LABELS," == *",$EXEMPT_LABEL,"* ]]; then
+              echo "carries $EXEMPT_LABEL" >&2; echo keep; return
+            fi
+            if [[ -n "$TRIAGE_USERS" && -n "$ACTOR" && "${list,,}" == *",${ACTOR,,},"* ]]; then
+              echo "$ACTOR is triage" >&2; echo keep; return
+            fi
+            echo "no lane matched" >&2; echo demote
+          }
+          # END draft-decision
+          decision=$(draft_decision)
+          if [[ "$decision" == keep ]]; then
+            echo "#$PR stays ready"
+            exit 0
+          fi
+          gh pr ready "$PR" -R "$R" --undo
+          gh pr comment "$PR" -R "$R" --body "Returned to draft by draft-guard: new PRs start as drafts and only triage marks them ready."
+
+  merge-receipt:
+    if: >-
+      inputs.merge-receipt && github.event_name == 'pull_request_target'
+      && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      pull-requests: write # create the receipt comment
+      contents: read # confirm the merge commit exists
+    steps:
+      - name: Post merge receipt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          # One round-trip: fill every missing field from a single pulls API
+          # response, then keep the per-field validation. Guards treat both
+          # empty and the jq-null literal.
+          missing=0
+          for var_name in MERGE_SHA MERGED_BY MERGED_AT; do
+            var_value="${!var_name}"
+            if [ -z "${var_value}" ] || [ "${var_value}" = "null" ]; then
+              missing=1
+            fi
+          done
+          MERGED_BY_SRC="webhook payload"
+          if [ "${missing}" -eq 1 ]; then
+            meta=$(gh api "repos/${REPO}/pulls/${PR}" \
+              --jq '[(.merge_commit_sha // "null"), (.merged_by.login // "null"), (.merged_at // "null")] | @tsv') || {
+              echo "::error::pull metadata lookup failed for ${REPO}#${PR}"
+              exit 1
+            }
+            IFS=$'\t' read -r api_sha api_by api_at <<<"${meta}"
+            if [ -z "${MERGE_SHA}" ] || [ "${MERGE_SHA}" = "null" ]; then
+              MERGE_SHA="${api_sha}"
+            fi
+            if [ -z "${MERGED_BY}" ] || [ "${MERGED_BY}" = "null" ]; then
+              MERGED_BY="${api_by}"
+              MERGED_BY_SRC="pulls API"
+            fi
+            if [ -z "${MERGED_AT}" ] || [ "${MERGED_AT}" = "null" ]; then
+              MERGED_AT="${api_at}"
+            fi
+          fi
+          # github.actor is a LAST resort: for pull_request_target events it
+          # is not guaranteed to be the actual merger. The receipt records the
+          # provenance so consumers can weigh a fallback attribution.
+          if { [ -z "${MERGED_BY}" ] || [ "${MERGED_BY}" = "null" ]; } && [ -n "${ACTOR}" ]; then
+            MERGED_BY="${ACTOR}"
+            MERGED_BY_SRC="github.actor fallback"
+          fi
+
+          # Fail loud, never emit a degraded receipt.
+          for var_name in MERGE_SHA MERGED_BY MERGED_AT; do
+            var_value="${!var_name}"
+            if [ -z "${var_value}" ] || [ "${var_value}" = "null" ]; then
+              echo "::error::${var_name} unavailable for ${REPO}#${PR}"
+              exit 1
+            fi
+          done
+          # Exact 40-hex (SHA-1) or 64-hex (SHA-256): a permissive pattern
+          # could admit abbreviated/odd-length values into the receipt.
+          if ! [[ "${MERGE_SHA}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::merge_commit_sha malformed for ${REPO}#${PR}: ${MERGE_SHA}"
+            exit 1
+          fi
+          export MERGE_SHA
+          # Server-side proof the sha is a real commit (replaces a checkout).
+          actual=$(gh api "repos/${REPO}/commits/${MERGE_SHA}" --jq '.sha') || {
+            echo "::error::merge commit ${MERGE_SHA} not found in ${REPO}"
+            exit 1
+          }
+          if [ "${actual}" != "${MERGE_SHA}" ]; then
+            echo "::error::receipt SHA ${MERGE_SHA} does not match API commit ${actual}"
+            exit 1
+          fi
+
+          # Idempotent on merge sha. Selection happens inside gh's own jq so
+          # the marker and the sha bind to the SAME comment object. Only the
+          # workflow token's own bot comments may satisfy the predicate: a
+          # human quoting the marker must never suppress the real receipt.
+          # --paginate re-applies the filter per page, hence counting ids;
+          # wc -l drains, so no SIGPIPE under pipefail.
+          scan_receipts() {
+            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+              --jq '.[]
+                    | select(.user.login == "github-actions[bot]"
+                         and (.body | contains("<!-- merge-receipt -->"))
+                         and (.body | test("sha:[[:space:]]*" + $ENV.MERGE_SHA + "([^0-9a-f]|$)")))
+                    | .id' | wc -l | tr -d ' '
+          }
+          # Bounded retry (3 attempts) around scan-then-post: a transient API
+          # failure must not silently break the every-merge guarantee, and the
+          # scan re-runs before every re-post so a POST that committed but lost
+          # its response only double-posts if read-after-write lag outlasts
+          # the 30 s backoff. Permanent failures fail loud.
+          ensure_receipt() {
+            local attempt=1 receipts
+            while true; do
+              if receipts=$(scan_receipts); then
+                if [ "${receipts}" -gt 0 ]; then
+                  echo "receipt already present for ${MERGE_SHA}; nothing to do"
+                  return 0
+                fi
+                if gh api "repos/${REPO}/issues/${PR}/comments" -f "body=${body}" --jq '.html_url'; then
+                  return 0
+                fi
+              fi
+              if [ "${attempt}" -ge 3 ]; then
+                echo "::error::ensure-receipt failed after ${attempt} attempts for ${REPO}#${PR}"
+                return 1
+              fi
+              echo "ensure-receipt attempt ${attempt} failed; retrying in 30s" >&2
+              attempt=$((attempt + 1))
+              sleep 30
+            done
+          }
+
+          body=$(printf '%s\n' \
+            '<!-- merge-receipt -->' \
+            '```' \
+            "sha:       ${MERGE_SHA}" \
+            "pr:        ${REPO}#${PR}" \
+            "actor:     ${MERGED_BY}" \
+            "actor_src: ${MERGED_BY_SRC}" \
+            "merged_at: ${MERGED_AT}" \
+            'gate:      UNATTRIBUTED' \
+            '```' \
+            '' \
+            '<sub>Emitted by the fleet `pr-hygiene` merge-receipt job. `gate:` is amended by the merging seat.</sub>')
+
+          ensure_receipt
+
+  merge-conflict:
+    if: >-
+      inputs.merge-conflict
+      && contains(fromJSON('["pull_request_target","push","schedule","workflow_dispatch"]'), github.event_name)
+      && (github.event_name != 'pull_request_target'
+          || contains(fromJSON('["opened","synchronize","reopened","ready_for_review","edited"]'), github.event.action))
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.conflict-timeout-minutes }}
+    permissions:
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Publish merge-conflict status on live PR heads
+        shell: "python3 {0}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASES: ${{ inputs.conflict-bases }}
+        run: |
+          import json
+          import os
+          import re
+          import time
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          bases = {b.strip() for b in os.environ["BASES"].split(",") if b.strip()}
+          repository = os.environ["GITHUB_REPOSITORY"]
+          api = os.environ["GITHUB_API_URL"].rstrip("/") + "/repos/" + repository
+          server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = Request(api + path, data=body, headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urlopen(req, timeout=15) as response:
+                  return json.load(response)
+
+          def publish(number, head, state, description):
+              status = {
+                  "context": "merge-conflict",
+                  "state": state,
+                  "description": description,
+                  "target_url": f"{server}/{repository}/pull/{number}",
+              }
+              # Statuses are newest first. Never let an older matching status
+              # hide a later transition, including one on a subsequent page.
+              for page in range(1, 11):
+                  previous = request(f"/commits/{head}/statuses?per_page=100&page={page}")
+                  latest = next((s for s in previous if s["context"] == status["context"]), None)
+                  if latest is not None:
+                      if all(latest.get(key) == value for key, value in status.items()):
+                          return
+                      break
+                  if len(previous) < 100:
+                      break
+              else:
+                  raise RuntimeError("Status scan limit reached; refusing a duplicate status")
+              request("/statuses/" + head, status)
+
+          # Aggregate retry-sleep budget: 101 unknown PRs used to mean 606 s
+          # of mandatory sleep inside a 600 s job. Attempts are never
+          # skipped — once the budget is spent, retries stop pacing but
+          # still run to a terminal-or-error status for every scanned PR.
+          sleep_left = 420.0
+
+          def pace_retry():
+              global sleep_left
+              if sleep_left > 0:
+                  pause = min(2.0, sleep_left)
+                  sleep_left -= pause
+                  time.sleep(pause)
+
+          def inspect(number):
+              if not isinstance(number, int) or number <= 0:
+                  raise ValueError("Invalid PR number")
+              head = None
+              for attempt in range(4):
+                  if attempt:
+                      pace_retry()
+                  pr = request(f"/pulls/{number}")
+                  base = pr["base"]["ref"]
+                  if pr["state"] != "open" or base not in bases:
+                      return
+                  live_head = pr["head"]["sha"]
+                  if not isinstance(live_head, str) or not re.fullmatch("[0-9a-f]{40}", live_head):
+                      raise ValueError("Invalid PR head SHA")
+                  conclusive = (
+                      pr["mergeable"] is True
+                      or pr["mergeable"] is False
+                      or pr.get("mergeable_state") == "dirty"
+                  )
+                  if live_head != head:
+                      head = live_head
+                      if not conclusive:
+                          # Pending only while mergeability is genuinely
+                          # unknown; settled heads publish terminal directly.
+                          publish(number, head, "pending", f"Checking mergeability with {base}.")
+                  if pr["mergeable"] is False or pr.get("mergeable_state") == "dirty":
+                      publish(number, head, "failure", f"Conflicts with {base}: merge/rebase {base}; pull_request CI is skipped.")
+                      return
+                  if pr["mergeable"] is True:
+                      publish(number, head, "success", f"No merge conflict with {base}; pull_request CI can run.")
+                      return
+              publish(number, head, "error", "Mergeability unknown after 4 checks; rerun merge-conflict.")
+
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                  # Single-PR event: reconcile exactly this PR and fail the
+                  # run visibly on any API error — there is no later PR in
+                  # a queue whose reconciliation an error would abort.
+                  inspect(json.load(event_file)["number"])
+          else:
+              # Bounded scan: fail visibly rather than silently truncate a large queue.
+              numbers = []
+              for base in sorted(bases):
+                  for page in range(1, 6):
+                      query = urlencode({"state": "open", "base": base, "per_page": 100, "page": page})
+                      prs = request("/pulls?" + query)
+                      numbers.extend(pr["number"] for pr in prs)
+                      if len(prs) < 100:
+                          break
+                  else:
+                      raise RuntimeError(f"Open-PR scan limit reached (500 for {base}); split the queue before rerunning")
+              # One PR's API failure must not abort reconciliation for every
+              # later PR: quarantine it, finish the queue, then report all
+              # failures deterministically on stdout.
+              failures = []
+              for number in sorted(set(numbers)):
+                  try:
+                      inspect(number)
+                  except Exception as error:
+                      failures.append((number, error))
+              for number, error in failures:
+                  print(f"merge-conflict: scan failure PR {number}: {error!r}")
+              if failures:
+                  # A quarantined scan still reconciled every PR it could;
+                  # fail the job only now so the mode agrees with the
+                  # single-PR event path (which re-raises API errors).
+                  raise SystemExit(1)

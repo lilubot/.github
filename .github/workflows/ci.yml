@@ -1,0 +1,113 @@
+name: ci
+
+# Self-test for this repo: lint every workflow, run the script tests, and
+# call each reusable workflow as a real caller would (GitHub-hosted runners:
+# this repo is public, so they are free). heavy-again proves verdict reuse:
+# it must hit the tree verdict heavy posted moments earlier in this run.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      - name: actionlint
+        # SC2016: jq programs and markdown literals are single-quoted on purpose.
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -ignore 'SC2016:'
+      - name: zizmor
+        run: uvx zizmor@1.30.1 .github
+      - name: JSON templates parse
+        run: jq -e . labels.json rulesets/*.json >/dev/null
+
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: for t in tests/*.test.sh; do echo "== $t"; bash "$t" || exit 1; done
+
+  fast:
+    uses: ./.github/workflows/fast.yml # zizmor: ignore[self-repository] -- the self-test must call the PR's own copy; ./ is that
+    permissions:
+      contents: read
+    with:
+      runner: '["ubuntu-24.04"]'
+      setup: python
+      setup-version: "3.12"
+      lint-cmd: for f in .github/scripts/*.sh tests/*.sh; do bash -n "$f"; done
+      typecheck-cmd: ""
+      test-cmd: uv run --no-project python -c "import sys; assert sys.version_info[:2] == (3, 12)"
+
+  security:
+    uses: ./.github/workflows/security.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      runner: '["ubuntu-24.04"]'
+
+  preflight:
+    uses: ./.github/workflows/preflight.yml # zizmor: ignore[self-repository]
+    with:
+      runner: '["ubuntu-24.04"]'
+      pools: '[["ubuntu-24.04"]]'
+
+  heavy:
+    needs: fast
+    uses: ./.github/workflows/heavy.yml # zizmor: ignore[self-repository]
+    permissions: &heavy-perms
+      contents: read
+      statuses: write
+      pull-requests: read
+      actions: read
+    with: &heavy-with
+      control-runner: '["ubuntu-24.04"]'
+      verdict-context: verdict/selftest
+      legs: >-
+        [{"name":"bash","runner":["ubuntu-24.04"],"cmd":"bash tests/fleet-ci.test.sh","timeout":5},
+         {"name":"pwsh","runner":["ubuntu-24.04"],"shell":"pwsh","cmd":"bash -c 'exit 7'; if ($LASTEXITCODE -ne 7) { exit 1 }; bash -c 'exit 0'; if ($LASTEXITCODE) { exit $LASTEXITCODE }","timeout":5},
+         {"name":"node","runner":["ubuntu-24.04"],"setup":"node","setup-version":"22","setup-cmd":"node --version","cmd":"node -e \"process.exit(0)\"","timeout":5},
+         {"name":"powershell","runner":["windows-2025"],"shell":"powershell","setup-cmd":"$PSVersionTable.PSVersion","cmd":"if ($PSVersionTable.PSVersion.Major -ne 5) { exit 1 }; cmd /c exit 7; if ($LASTEXITCODE -ne 7) { exit 1 }; cmd /c exit 0; if ($LASTEXITCODE) { exit $LASTEXITCODE }","timeout":10}]
+
+  heavy-again:
+    needs: heavy
+    uses: ./.github/workflows/heavy.yml # zizmor: ignore[self-repository]
+    permissions: *heavy-perms
+    with: *heavy-with
+
+  reuse:
+    needs: [heavy, heavy-again]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: heavy-again reused heavy's tree verdict
+        env:
+          HIT: ${{ needs.heavy-again.outputs.hit }}
+          T1: ${{ needs.heavy.outputs.tree }}
+          T2: ${{ needs.heavy-again.outputs.tree }}
+        run: |
+          echo "hit=$HIT tree=$T1 / $T2"
+          [ "$HIT" = true ] && [ -n "$T1" ] && [ "$T1" = "$T2" ]

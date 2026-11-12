@@ -1,7 +1,8 @@
 name: semgrep-reusable
 
-# Shared Semgrep CE gate for lilubot repos. Runs on the cupid-semgrep pool,
-# which bakes Semgrep + the fleet rule pack at /opt/semgrep-rules.
+# Shared Semgrep CE gate for lilubot repos. `runner` is the caller's pool
+# (today '["self-hosted","cupid-semgrep"]'), which must bake Semgrep + the
+# fleet rule pack at /opt/semgrep-rules.
 # Push scans report legacy findings and stay green; PR scans fail only on
 # findings new relative to the base commit (--baseline-commit).
 #
@@ -11,6 +12,10 @@ name: semgrep-reusable
 on:
   workflow_call:
     inputs:
+      runner:
+        description: JSON label list for runs-on, e.g. '["self-hosted","cupid-semgrep"]'
+        type: string
+        required: true
       packs:
         description: Extra registry packs, whitespace-separated (e.g. "p/cpp p/csharp")
         type: string
@@ -24,7 +29,7 @@ permissions:
 
 jobs:
   semgrep:
-    runs-on: [self-hosted, cupid-semgrep]
+    runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
